@@ -1,0 +1,215 @@
+name: Check and Package Game Update (Windows)
+
+# ===================================================================
+# Workflow triggers
+# ===================================================================
+on:
+  schedule:
+    # Cron schedule: runs every 2 hours on the hour (00:00, 02:00, 04:00, ...)
+    - cron: '0 */2 * * *'
+
+  workflow_dispatch:
+    # Allows manual triggering from GitHub UI
+    inputs:
+      force_version:
+        description: 'Force version (number only)'
+        required: false
+        type: string
+
+# ===================================================================
+# Concurrency settings
+# ===================================================================
+concurrency:
+  # Ensure only one instance of this workflow runs at a time
+  group: game-updater
+  cancel-in-progress: false
+
+# ===================================================================
+# Permissions required by this workflow
+# ===================================================================
+permissions:
+  contents: write   # Allows creating releases and uploading artifacts
+  packages: read    # Allows reading packages if needed
+
+# ===================================================================
+# Environment variable: CHANNEL
+# ===================================================================
+env:
+  # -------------------------------------------------------------------
+  # CHANGE THIS VALUE ONLY PER REPO:
+  #   release      -> stable channel (stable releases)
+  #   pre-release  -> testing channel (early builds)
+  # This variable controls which Hytale server channel is checked
+  # -------------------------------------------------------------------
+  CHANNEL: release
+
+# ===================================================================
+# Jobs section: define workflow jobs
+# ===================================================================
+jobs:
+  update:
+    # Name displayed in GitHub Actions UI
+    name: Check Channel (Windows)
+
+    # Run job on latest Ubuntu runner
+    runs-on: ubuntu-latest
+
+    # ===================================================================
+    # Steps: sequential tasks executed in the job
+    # ===================================================================
+    steps:
+      
+      # -------------------------------------------------------------------
+      # Step 1: Checkout the repository
+      # -------------------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------
+      # Step 2: Setup Python environment
+      # -------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      # -------------------------------------------------------------------
+      # Step 3: Install system dependencies
+      # -------------------------------------------------------------------
+      - name: Install Dependencies
+        run: |
+          # Update package lists
+          sudo apt-get update
+
+          # Install RAR, unzip, jq (required for packaging & JSON parsing)
+          sudo apt-get install -y rar unzip jq
+
+          # Install Python requests library (used in check_version.py)
+          pip install requests
+
+      # -------------------------------------------------------------------
+      # Step 4: Determine last released version in THIS repo
+      # -------------------------------------------------------------------
+      - name: Analyze Existing Releases
+        id: history
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Initialize last known version
+          LAST_VER=0
+
+          # Retrieve last 100 releases as JSON
+          JSON_DATA=$(gh release list --limit 100 --json tagName)
+
+          if [ -n "$JSON_DATA" ]; then
+            # Extract numeric version from tag names (strip prefix up to '-v')
+            CALC_VER=$(echo "$JSON_DATA" | jq -r '
+              [
+                .[] |
+                .tagName |
+                select(test("-v[0-9]+$")) |
+                sub("^.*-v"; "") |
+                tonumber
+              ] | max
+            ')
+
+            if [ "$CALC_VER" != "null" ]; then
+              LAST_VER=$CALC_VER
+            fi
+          fi
+
+          # Output LAST_VER for later steps
+          echo "LAST_VER=$LAST_VER" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # Step 5: Check Hytale server for next version
+      # -------------------------------------------------------------------
+      - name: Check for Updates
+        id: version_check
+        env:
+          MANUAL_VER: ${{ inputs.force_version }}
+          CHANNEL: ${{ env.CHANNEL }}
+          LAST_KNOWN_VER: ${{ steps.history.outputs.LAST_VER }}
+        run: |
+          # Run Python script to determine next available patch
+          python3 scripts/check_version.py >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # Step 6: Build Windows client
+      # -------------------------------------------------------------------
+      - name: Build Windows Client
+        # Only run if a new version was found
+        if: steps.version_check.outputs.FOUND == 'true'
+        run: |
+          # Ensure build script is executable
+          chmod +x scripts/install.sh
+
+          # Run install script with version and channel
+          ./scripts/install.sh \
+            "${{ steps.version_check.outputs.VERSION }}" \
+            "${{ env.CHANNEL }}"
+
+      # -------------------------------------------------------------------
+      # Step 7: Package Windows archive
+      # -------------------------------------------------------------------
+      - name: Package Windows Archive
+        id: package
+        if: steps.version_check.outputs.FOUND == 'true'
+        run: |
+          VER="${{ steps.version_check.outputs.VERSION }}"
+          CHANNEL="${{ env.CHANNEL }}"
+          FILE="Hytale-${CHANNEL}-v${VER}-windows-amd64.rar"
+
+          # Max size per RAR part (splits automatically if >2 GB)
+          PART_SIZE=2000m
+
+          # Create multi-part RAR archive
+          rar a -r -ep1 -v$PART_SIZE "$FILE" build_windows/*
+
+          # Save full archive name for release upload
+          echo "ARCHIVE_NAME=$FILE" >> "$GITHUB_OUTPUT"
+
+          # Save base name (without .rar) for multi-part upload
+          echo "ARCHIVE_BASENAME=${FILE%.rar}" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # Step 8: Create release commit (required for correct sorting)
+      # -------------------------------------------------------------------
+      - name: Create release commit
+        if: steps.version_check.outputs.FOUND == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit --allow-empty -m "Release ${{ env.CHANNEL }}-v${{ steps.version_check.outputs.VERSION }}"
+
+          git push origin HEAD:main
+
+      # -------------------------------------------------------------------
+      # Step 9: Create GitHub Release
+      # -------------------------------------------------------------------
+      - name: Create GitHub Release
+        if: steps.version_check.outputs.FOUND == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          # Tag for the release
+          tag_name: ${{ env.CHANNEL }}-v${{ steps.version_check.outputs.VERSION }}
+
+          # Release title
+          name: Hytale ${{ env.CHANNEL }}-v${{ steps.version_check.outputs.VERSION }}
+
+          # Release body (description)
+          body: |
+            Automated Windows build.
+
+            **Version:** ${{ steps.version_check.outputs.VERSION }}
+            **Channel:** ${{ env.CHANNEL }}
+
+          # Attach build archive(s)
+          files: |
+            ${{ steps.package.outputs.ARCHIVE_BASENAME }}*.rar
+
+          # Both release and pre-release repo output normal releases
+          prerelease: false
